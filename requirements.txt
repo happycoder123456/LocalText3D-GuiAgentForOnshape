@@ -1,0 +1,9 @@
+# Core agent (server + Ollama client) needs only the Python standard library.
+# These are the optional features:
+
+# Browser control of Onshape (Run / Record / Replay)
+playwright>=1.44.0
+
+# Learn from YouTube videos (frames also use ffmpeg; Pillow is used for images)
+yt-dlp>=2024.8.0
+pillow>=10.0.0

@@ -1,0 +1,49 @@
+# OnshapeGuiAgent ignores
+.venv/
+.venv-agent/
+__pycache__/
+*.pyc
+.pytest_cache/
+dist/
+
+# Secrets / local credentials (never commit). .env.example is the generic template.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+id_rsa*
+credentials.json
+secrets.json
+
+# Local runtime data: dataset, screenshots, videos, browser profile (holds login)
+agent_dataset/
+episodes.jsonl
+memory.jsonl
+last_session.json
+debug_shots/
+run_log.jsonl
+screenshots/
+videos/
+frames/
+
+# Browser profile: contains the Onshape session (cookies). NEVER commit.
+browser_profile/
+saved_cookies.json
+*.jsonl
+
+# Logs / local scratch
+*.log
+*.tmp
+*.png.tmp
+scripts/_*.png
+scripts/_*.jpg
+
+# Editors / OS
+.vscode/
+.idea/
+.vs/
+.DS_Store
+Thumbs.db
+scripts/exp_*.png

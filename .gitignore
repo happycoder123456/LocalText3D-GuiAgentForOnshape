@@ -47,3 +47,7 @@ scripts/_*.jpg
 .DS_Store
 Thumbs.db
 scripts/exp_*.png
+
+# CI workflow kept local-only until the gh token has the workflow scope
+# (gh auth refresh -s workflow), then delete this line and: git add .github
+.github/

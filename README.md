@@ -34,9 +34,31 @@ Each person runs the sidecar and Ollama **on their own machine**. The sidecar bi
   or skip that step — the driver falls back to your installed **Google Chrome**, then **Microsoft Edge**.
 - [ffmpeg](https://ffmpeg.org) on your PATH for video learning (optional; frames fall back to OpenCV if you prefer `pip install opencv-python-headless`).
 
-## Quick start
+## Install it like a Windows app (recommended)
 
-**Desktop app:** double-click the **`Onshape Agent`** icon on your Desktop (or **`Onshape Agent Desktop.bat`** in this folder). It sets up the environment on first run, starts Ollama, and opens the app — a dark-themed window with three tabs:
+You do **not** need to open a console, find scripts, or know where anything lives. From the folder you downloaded/cloned this project to:
+
+1. **Install [Python 3.13](https://www.python.org/downloads/)** (64-bit, tick *Add python.exe to PATH* during install) and **[Ollama](https://ollama.com)**.
+2. Double-click **`Onshape Agent Desktop.bat`** in this folder — once. It installs everything (Python packages, a browser, shortcuts) and then opens the app. Takes a few minutes on the first run only.
+3. From then on, launch **“Onshape Agent”** like any installed program:
+   - an **“Onshape Agent” icon on your Desktop**, and
+   - **“Onshape Agent” in your Start Menu** (both are created for you in step 2 — you will never touch the `.bat` again).
+4. In the app, go to the **Session** tab → **Sign in to Onshape** → sign in once in the browser window that opens. Done.
+
+> Cloned via `git clone https://github.com/happycoder123456/LocalText3D-GuiAgentForOnshape.git`? Same steps — everything above works straight out of the clone.
+
+**Where things live** (for reference only — the shortcuts handle all of this):
+
+| Thing | Location |
+| --- | --- |
+| The app itself | the folder you cloned/downloaded (contains `agent\`); launched by `.venv-agent\Scripts\pythonw.exe -m agent gui` |
+| Desktop / Start Menu shortcut | `Desktop\Onshape Agent.lnk` / `Start Menu\Programs\Onshape Agent.lnk` (auto-created) |
+| Your Onshape login + data | `%USERPROFILE%\OnshapeGuiAgent\agent_dataset` (outside the program folder; gitignored, never uploaded) |
+| Ollama models | managed by Ollama itself |
+
+## Quick start (what the app looks like)
+
+Launching **Onshape Agent** opens a dark-themed window with three tabs:
 
 - **Model** — type a goal, preview the plan, run/stop the agent, watch live progress
 - **Learn from video** — paste a YouTube URL and watch it distill techniques into local memory
@@ -44,11 +66,9 @@ Each person runs the sidecar and Ollama **on their own machine**. The sidecar bi
 
 The app starts the sidecar by itself; no console wrangling needed.
 
-**From the Desktop:** double-click the **`Onshape Agent`** icon — it launches the app directly (no console window). **`Start Onshape Agent`** opens the console menu instead.
+## Console / command-line use (optional)
 
-**Console menu instead:** double-click **`Start Onshape Agent.bat`** — same setup, then a sign-in / run / plan / learn / status menu.
-
-Or drive it by hand — run every command **from this project folder** (the one containing `agent\`), not from `~/OnshapeGuiAgent` (that is only the dataset). In PowerShell, commands in the current folder need a leading `.\`:
+Prefer a terminal? Everything is also drivable by hand — run every command **from this project folder** (the one containing `agent\`), not from `~/OnshapeGuiAgent` (that is only the data folder). In PowerShell, commands in the current folder need a leading `.\`:
 
 ```powershell
 # 0. desktop app
@@ -143,9 +163,8 @@ No GPU, no Ollama, no browser needed:
 python -m unittest discover -s tests
 ```
 
-- 186 tests covering loopback security, action/plan parsing, memory, the video teacher pipeline, browser allowlists, the agent loop (with an injected fake browser), the HTTP sidecar, and the desktop GUI's sidecar client.
-- Every push and pull request runs the suite in GitHub Actions (`.github/workflows/tests.yml`).
-- Tests that need Playwright skip automatically when it is not installed.
+- 252 tests covering loopback security, action/plan parsing, memory, the video teacher pipeline, browser allowlists, the agent loop (with an injected fake browser), the HTTP sidecar, and the desktop GUI's sidecar client.
+- The GitHub Actions workflow (`.github/workflows/tests.yml`) is **optional** — it only re-runs this suite on GitHub's servers. Nothing in the app depends on it; the tests above run identically on any machine.
 
 Optional end-to-end smoke tests (need the optional deps):
 

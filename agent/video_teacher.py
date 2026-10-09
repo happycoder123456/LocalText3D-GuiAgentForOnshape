@@ -1117,8 +1117,14 @@ def learn_concepts_from_video(
     max_minutes: float = 6.0,
     dataset_root: Path | None = None,
     on_progress: ProgressFn | None = None,
+    cancelled: "callable[[], bool] | None" = None,
 ) -> dict[str, Any]:
-    """Full pipeline: fetch -> keyframes -> segmented concept cards with steps."""
+    """Full pipeline: fetch -> keyframes -> segmented concept cards with steps.
+
+    ``cancelled`` is polled between segments and between step-teaching cards;
+    raising StopIteration lets the UI Stop button end a long lesson promptly
+    instead of after every remaining Ollama call.
+    """
     started = time.time()
     max_minutes = float(max(1.0, min(1200.0, max_minutes)))
     video_path, cues, title = fetch_video_source(
@@ -1147,6 +1153,8 @@ def learn_concepts_from_video(
 
     all_candidates: list[dict[str, Any]] = []
     for si, (t0, t1) in enumerate(segments):
+        if cancelled is not None and cancelled():
+            raise StopIteration("Video learning stopped by user")
         _progress(
             on_progress,
             f"Scanning segment {si + 1}/{len(segments)} ({t0 / 60:.0f}–{t1 / 60:.0f} min)…",
@@ -1201,6 +1209,8 @@ def learn_concepts_from_video(
     # LLM step-teaching is the slow part — cap it so a long lesson stays tractable.
     step_llm_cap = min(len(take), 64)
     for i, card in enumerate(take):
+        if cancelled is not None and cancelled():
+            raise StopIteration("Video learning stopped by user")
         card = dict(card)
         card["video"] = str(video_path.name)
         if i < step_llm_cap:

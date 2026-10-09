@@ -890,6 +890,34 @@ class LearningGuardTests(unittest.TestCase):
         finally:
             self.loop._running = False
 
+    def test_learn_cancel_flag_reaches_the_pipeline(self):
+        # Regression: Stop used to have no effect on a running video lesson —
+        # learn_concepts_from_video now receives the loop's stop flag and the
+        # thread ends with a "Stopped" status instead of an Error.
+        started = threading.Event()
+
+        def fake_learn(**kwargs):
+            started.set()
+            self.assertTrue(callable(kwargs.get("cancelled")))
+            # Simulate the user pressing Stop mid-lesson.
+            self.loop._stop.set()
+            if kwargs["cancelled"]():
+                raise StopIteration("Video learning stopped by user")
+            return {"concepts": []}
+
+        with mock.patch(
+            "agent.video_teacher.learn_concepts_from_video", side_effect=fake_learn
+        ):
+            self.loop.learn_from_video(url="https://youtu.be/abc123def45", max_minutes=1)
+            self.assertTrue(started.wait(5.0), "learn thread never started")
+        self.assertTrue(
+            _wait_until(lambda: not self.loop.status()["learning_video"]),
+            "learn thread did not finish",
+        )
+        st = self.loop.status()
+        self.assertEqual(st["status"], "Stopped")
+        self.assertIn("stopped", st["detail"].lower())
+
 
 class GoalHelperTests(unittest.TestCase):
     def test_goal_matches(self):

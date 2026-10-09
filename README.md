@@ -34,7 +34,19 @@ Each person runs the sidecar and Ollama **on their own machine**. The sidecar bi
   or skip that step — the driver falls back to your installed **Google Chrome**, then **Microsoft Edge**.
 - [ffmpeg](https://ffmpeg.org) on your PATH for video learning (optional; frames fall back to OpenCV if you prefer `pip install opencv-python-headless`).
 
-## Install it like a Windows app (recommended)
+## Download the installer (recommended)
+
+[![Download](https://img.shields.io/badge/Download-Onshape--Agent--Setup.exe-2ea44f?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/happycoder123456/LocalText3D-GuiAgentForOnshape/releases/latest/download/Onshape-Agent-Setup.exe)
+
+1. Click the button above — you get **`Onshape-Agent-Setup.exe`**, a normal Windows installer (not a zip).
+2. Run it. It installs the app to your user folder, sets up Python packages and the agent browser, and creates a **Start Menu + Desktop shortcut** automatically.
+3. If Python 3.13 is missing, install it once from [python.org](https://www.python.org/downloads/) (tick *Add python.exe to PATH*) and re-run the installer.
+4. Launch **Onshape Agent** from the Start Menu; first launch takes a couple of minutes while the local browser is prepared.
+5. In the app: **Session → Sign in to Onshape**.
+
+> Uninstall any time via *Settings → Apps*, like a normal Windows app.
+
+## Install it like a Windows app (from source)
 
 You do **not** need to open a console, find scripts, or know where anything lives. From the folder you downloaded/cloned this project to:
 

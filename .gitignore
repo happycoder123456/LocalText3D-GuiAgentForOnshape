@@ -51,3 +51,6 @@ scripts/exp_*.png
 # CI workflow kept local-only until the gh token has the workflow scope
 # (gh auth refresh -s workflow), then delete this line and: git add .github
 .github/
+
+# Installer build output (the exe ships as a GitHub Release asset)
+installer/Output/

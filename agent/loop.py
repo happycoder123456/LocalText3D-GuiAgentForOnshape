@@ -279,9 +279,12 @@ class AgentLoop:
         thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=timeout)
+        # The video-learn thread polls _stop between segments/cards (yt-dlp and
+        # Ollama calls stay blocking, so it cannot be joined instantly); the
+        # StopIteration handler above flips its status to "Stopped".
         self._running = False
         self._recording = False
-        if not self._learning_video:
+        if not self._learning_video and self._status not in {"Stopped", "Error"}:
             self._status = "Idle"
             self._mode = "idle"
 
@@ -1032,6 +1035,7 @@ class AgentLoop:
             ensure_video_path_in_dataset(path, self.root)
 
         self._learning_video = True
+        self._stop.clear()  # a prior stopped run must not cancel this lesson
         self._error = ""
         self._status = "Learning"
         self._mode = "learn"
@@ -1064,6 +1068,7 @@ class AgentLoop:
                     max_minutes=max_minutes,
                     dataset_root=self.root,
                     on_progress=on_progress,
+                    cancelled=self._stop.is_set,
                 )
                 concepts = result.get("concepts") or []
                 self._note_learn_progress("Saving concepts into memory…", percent=96.0, phase="saving")
@@ -1095,6 +1100,13 @@ class AgentLoop:
                     + ". Type a Goal, then Run Agent."
                 )
                 self._learn_history.append(self._detail[:240])
+            except StopIteration as exc:
+                # Clean stop requested from the Stop button, not a failure.
+                self._status = "Stopped"
+                self._detail = str(exc) or "Video learning stopped by user"
+                self._mode = "idle"
+                self._learn_phase = "stopped"
+                self._learn_history.append(self._detail[:240])
             except Exception as exc:
                 self._error = str(exc)[:300]
                 self._learn_phase = "error"
@@ -1102,6 +1114,8 @@ class AgentLoop:
                 self._detail = self._error
             finally:
                 self._learning_video = False
+                if not self.busy():
+                    self._stop.clear()
 
         self._video_thread = threading.Thread(target=_run, name="video-teacher", daemon=True)
         self._video_thread.start()

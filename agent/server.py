@@ -28,6 +28,14 @@ from agent.loopback import (
 
 MAX_BODY = 16_000_000
 MAX_GOAL_CHARS = 8192
+
+def _safe_error_text(exc: BaseException, limit: int = 300) -> str:
+    """One-line error for the client. Never echo absolute local paths."""
+    parts = []
+    for part in str(exc).split("\\"):
+        parts.append(part.split("/")[-1])
+    return (" ".join(parts))[:limit]
+
 _OLLAMA_CACHE_SEC = 4.0
 _ollama_cache: dict[str, Any] = {"t": 0.0, "models": [], "ok": False, "err": ""}
 _ollama_lock = threading.Lock()
@@ -136,7 +144,7 @@ class AgentHandler(BaseHTTPRequestHandler):
                 self._send(200, {"ok": True, "skills": cards, "concepts": concepts})
                 return
         except Exception as exc:
-            self._send(500, {"ok": False, "error": str(exc)[:300]})
+            self._send(500, {"ok": False, "error": _safe_error_text(exc)})
             return
         self._send(404, {"error": "not found"})
 
@@ -232,7 +240,7 @@ class AgentHandler(BaseHTTPRequestHandler):
             self._send(502, {"error": str(exc)[:300]})
             return
         except Exception as exc:
-            self._send(500, {"error": str(exc)[:300], **self.loop.status()})
+            self._send(500, {"error": _safe_error_text(exc), **self.loop.status()})
             return
 
         self._send(404, {"error": "not found"})

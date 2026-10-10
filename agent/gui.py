@@ -213,6 +213,7 @@ class App(tk.Tk):
         # None = never reached yet (bootstrap is still starting it), so a
         # slow first boot is not mistaken for a crash.
         self._sidecar_up: bool | None = None
+        self._fullscreen_on = False  # mirrored from sidecar window_state
 
         self._apply_style()
         self._build_header()
@@ -223,6 +224,7 @@ class App(tk.Tk):
         self.log_line("Starting — checking sidecar on 127.0.0.1:8767 …")
         self.after(200, self._bootstrap)
         self.after(300, self._drain_events)
+        self.after(400, self.on_refresh_models)
 
     # -- chrome ---------------------------------------------------------------
 
@@ -311,6 +313,25 @@ class App(tk.Tk):
         self.ollama_chip.pack(side="right", padx=(10, 0))
         self.model_chip = tk.Label(head, text="", bg=SURFACE, fg=MUTED, font=SMALL_FONT)
         self.model_chip.pack(side="right", padx=(10, 0))
+        # Fullscreen toggle for the Onshape browser window (F11-like).
+        self.fs_btn = tk.Button(
+            head,
+            text="⛶  Onshape fullscreen",
+            command=self.on_toggle_fullscreen,
+            bg=SURFACE, fg=FG, activebackground=CARD, activeforeground=ACCENT,
+            font=SMALL_FONT, bd=0, cursor="hand2", padx=10, pady=4,
+        )
+        self.fs_btn.pack(side="right", padx=(10, 18))
+        # Fullscreen toggle for the Onshape browser window (F11-like).
+        self.fs_var = tk.BooleanVar(value=False)
+        self.fs_btn = tk.Button(
+            head,
+            text="⛶  Onshape fullscreen",
+            command=self.on_toggle_fullscreen,
+            bg=SURFACE, fg=FG, activebackground=CARD, activeforeground=ACCENT,
+            font=SMALL_FONT, bd=0, cursor="hand2", padx=10, pady=4,
+        )
+        self.fs_btn.pack(side="right", padx=(10, 18))
 
     def _build_body(self) -> None:
         """Sidebar navigation (VS Code / modern app feel) + page container."""
@@ -382,6 +403,23 @@ class App(tk.Tk):
         ttk.Spinbox(opts, from_=1, to=2500, width=6, textvariable=self.max_steps_var).pack(
             side="left", padx=(4, 0)
         )
+        # Smarts controls: which vision model drives clicks + plan mode.
+        ttk.Label(opts, text="  Vision model:", style="Card.TLabel").pack(
+            side="left", padx=(16, 0)
+        )
+        self.model_var = tk.StringVar(value="auto (best available)")
+        self.model_combo = ttk.Combobox(
+            opts, textvariable=self.model_var, width=24, state="readonly"
+        )
+        self.model_combo.pack(side="left", padx=(4, 0))
+        refresh_btn = ttk.Button(
+            opts, text="↻", width=3, style="Ghost.TButton", command=self.on_refresh_models
+        )
+        refresh_btn.pack(side="left", padx=(4, 0))
+        self.fs_btn2 = ttk.Button(
+            opts, text="⛶ Fullscreen", style="Ghost.TButton", command=self.on_toggle_fullscreen
+        )
+        self.fs_btn2.pack(side="left", padx=(12, 0))
 
         actions = ttk.Frame(tab, style="Card.TFrame")
         actions.pack(fill="x", pady=(0, 14))
@@ -586,9 +624,16 @@ class App(tk.Tk):
             steps = max(1, min(2500, int(self.max_steps_var.get())))
         except ValueError:
             steps = 160
+        chosen = self.model_var.get().strip()
+        model = "" if not chosen or chosen.startswith("auto") else chosen
         self._call(
             "/agent/start",
-            {"goal": goal, "max_steps": steps, "use_plan": bool(self.use_plan_var.get())},
+            {
+                "goal": goal,
+                "model": model,
+                "max_steps": steps,
+                "use_plan": bool(self.use_plan_var.get()),
+            },
             ok_msg=f"Run started: {goal}",
         )
 
@@ -659,8 +704,57 @@ class App(tk.Tk):
         except OSError as exc:
             messagebox.showerror("Cannot start browser", str(exc))
 
+    def on_refresh_models(self) -> None:
+        """Populate the vision-model dropdown from the local Ollama install."""
+
+        def work() -> None:
+            try:
+                with urllib.request.urlopen(OLLAMA_URL + "/api/tags", timeout=4) as r:
+                    payload = json.loads(r.read().decode("utf-8"))
+                names = [
+                    str(m.get("name") or "")
+                    for m in (payload.get("models") or [])
+                    if isinstance(m, dict) and m.get("name")
+                ]
+            except Exception:
+                names = []
+            self.events.put(("models", names))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_toggle_fullscreen(self) -> None:
+        """Push the Onshape browser window into/out of true fullscreen.
+
+        The agent browser is a separate window, so 'Onshape fullscreen' means
+        THAT window — not this GUI. The status poll reflects whatever the
+        sidecar reports afterwards.
+        """
+        wanted = "normal" if self._fullscreen_on else "fullscreen"
+
+        def work() -> None:
+            try:
+                self.client.post("/browser/window", {"state": wanted})
+                self.events.put((
+                    "log",
+                    (
+                        "Onshape browser → fullscreen" if wanted == "fullscreen" else "Onshape browser → normal window",
+                        "ok",
+                    ),
+                ))
+            except SidecarError as exc:
+                self.events.put(("log", (f"fullscreen toggle failed: {exc}", "err")))
+
+        threading.Thread(target=work, daemon=True).start()
+
     def on_open_dataset(self) -> None:
-        root_path = str((self._status.get("memory") or {}).get("root") or "")
+        # The dataset root is derived LOCALLY (same helper the sidecar uses):
+        # /status no longer exposes absolute local paths.
+        try:
+            from agent.paths import default_dataset_dir
+
+            root_path = str(default_dataset_dir())
+        except Exception:
+            root_path = str((self._status.get("memory") or {}).get("root") or "")
         if not root_path:
             self.log_line("Dataset folder unknown yet (sidecar not ready).", "err")
             return
@@ -724,6 +818,12 @@ class App(tk.Tk):
                 elif kind == "health":
                     self._health = payload
                     self._render_chips()
+                elif kind == "models":
+                    names = [n for n in (payload or []) if isinstance(n, str)]
+                    if names:
+                        self.model_combo.configure(values=["auto (best available)"] + names)
+                    else:
+                        self.model_combo.configure(values=["auto (best available)"])
         except queue.Empty:
             pass
         self.after(300, self._drain_events)
@@ -820,6 +920,16 @@ class App(tk.Tk):
         detail = str(st.get("detail") or "")
         if detail:
             self.detail_lbl.configure(text=detail[:240])
+
+        # Mirror the browser window state so the toggle shows the real state
+        # (someone may have pressed F11 in that window directly).
+        fs_on = str(st.get("window_state") or "") == "fullscreen"
+        if fs_on != self._fullscreen_on:
+            self._fullscreen_on = fs_on
+            self.fs_btn.configure(
+                text="🗗  Exit fullscreen" if fs_on else "⛶  Onshape fullscreen",
+                fg=ACCENT if fs_on else FG,
+            )
 
         if running:
             step = int(st.get("step") or 0)

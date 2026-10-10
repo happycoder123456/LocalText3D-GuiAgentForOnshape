@@ -257,5 +257,46 @@ class BindRefusalTests(unittest.TestCase):
             httpd.server_close()
 
 
+class FakeBrowser:
+    """Minimal loop-driven browser double for window-state tests."""
+
+    def __init__(self):
+        self.fullscreen = False
+
+    available = True
+
+    def toggle_window_state(self, state):
+        self.fullscreen = str(state).strip().lower() in {"fullscreen", "f11", "full"}
+        return {"done": True, "fullscreen": self.fullscreen}
+
+
+class BrowserWindowStateTests(unittest.TestCase):
+    """Loop.set_window_state validates, applies, and reports window state."""
+
+    def _loop(self, name: str) -> AgentLoop:
+        return AgentLoop(dataset_root=Path(tempfile.mkdtemp(prefix=name)), browser=FakeBrowser())
+
+    def test_rejects_garbage(self):
+        loop = self._loop("win-bad-")
+        with self.assertRaises(ValueError):
+            loop.set_window_state("orbit-cam-360")
+
+    def test_normalizes_and_reports(self):
+        loop = self._loop("win-ok-")
+        out = loop.set_window_state("FULLSCREEN")
+        self.assertEqual(out.get("window_state"), "fullscreen")
+        self.assertEqual(loop.status()["window_state"], "fullscreen")
+        loop.set_window_state("normal")
+        self.assertEqual(loop.status()["window_state"], "")
+
+    def test_state_reapplied_after_new_browser(self):
+        loop = self._loop("win-reapply-")
+        loop.set_window_state("fullscreen")
+        loop._browser = None
+        loop._window_state_requested = False
+        loop._ensure_browser()
+        self.assertTrue(loop._window_state_requested)
+
+
 if __name__ == "__main__":
     unittest.main()

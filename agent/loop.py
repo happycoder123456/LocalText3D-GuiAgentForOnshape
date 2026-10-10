@@ -79,6 +79,44 @@ _VISIBLE_CHANGE_MIN = 8.0
 _MAX_PAGE_RELOADS = 3
 
 
+# A click target within this many pixels of the screenshot origin is
+# degenerate: Onshape's top strip is OS/browser chrome; the model occasionally
+# degenerates to 0..15-px 'clicks' which ARE harmless-noise (and, executed
+# dozens of times, what made runs look 'random').
+_DEGENERATE_CLICK_MAX_PX = 12
+
+
+def _sanitize_action(action: dict[str, Any], vp: tuple[int, int]) -> tuple[dict[str, Any], str]:
+    """Validate/fix one model action; returns (action, reject_reason).
+
+    reject_reason is empty when the action is fine (possibly after clamping).
+    """
+    kind = str(action.get("action") or "")
+    vw, vh = vp
+    if kind in {"click", "dblclick"}:
+        # DOM-label clicks carry no pixel coordinates: they're resolved in
+        # the driver against the REAL page (tooltip/aria labels), so the
+        # degenerate-coordinate checks below don't apply to them.
+        if str(action.get("target") or "").strip():
+            return action, ""
+        x, y = int(action.get("x") or 0), int(action.get("y") or 0)
+        # Degenerate: inside the chrome strip / ON the logo area. The most
+        # reliable live failure mode was (0,0)-(0,24) repeated "clicks".
+        if x < _DEGENERATE_CLICK_MAX_PX and y < _DEGENERATE_CLICK_MAX_PX:
+            return action, f"rejected degenerate click at ({x},{y}) — top-left corner is not a target"
+        # Demonstrated live: 46 % up-left offset when the model assumed a
+        # different viewport — clamp so a *slightly* off target still lands.
+        if not (0 <= x < vw and 0 <= y < vh):
+            action["x"] = max(0, min(vw - 1, x))
+            action["y"] = max(0, min(vh - 1, y))
+        return action, ""
+    if kind == "type":
+        text = str(action.get("text") or "").strip()
+        if not text:
+            return action, "rejected empty type action"
+    return action, ""
+
+
 def _frame_signature(b64: str) -> list[float]:
     """Tiny grayscale thumbnail used for change detection."""
     try:
@@ -192,6 +230,10 @@ class AgentLoop:
         self._driver_factory = driver_factory
         self._browser: Any | None = None
         self._last_browser_url = ""
+        # Requested browser window state. "" = normal/maximized window;
+        # "fullscreen" = hide browser chrome + OS chrome so the model gets the
+        # whole screen and Onshape gets room for the real UI.
+        self._window_state = ""
         self._thread: threading.Thread | None = None
         self._video_thread: threading.Thread | None = None
         self._lifecycle = threading.Lock()
@@ -208,6 +250,7 @@ class AgentLoop:
         self._model = ""
         self._planner_model = ""
         self._mode = "idle"  # idle | plan | vision | record | learn
+        self._window_state_requested = False  # set True right after a run applies it
         self._plan: list[dict[str, str]] = []
         self._plan_i = 0
         # (plan index, frame signature before the action) awaiting visual
@@ -248,8 +291,12 @@ class AgentLoop:
             "learn_percent": self._learn_percent,
             "learn_phase": self._learn_phase,
             "learn_history": self._learn_history[-8:],
-            "memory": self.memory.stats(),
+            # status() crosses the HTTP boundary (GUI polls it constantly):
+            # never include the absolute dataset path there — the GUI derives
+            # the folder locally via agent.paths.default_dataset_dir().
+            "memory": {k: v for k, v in self.memory.stats().items() if k != "root"},
             "browser_url": self._safe_browser_url(),
+            "window_state": self._window_state,
         }
 
     def _safe_browser_url(self) -> str:
@@ -290,6 +337,35 @@ class AgentLoop:
 
     # ------------------------------------------------------------- browser
 
+    def set_window_state(self, state: str) -> dict[str, Any]:
+        """Users control the agent browser's window state from the GUI.
+
+        Accepted: "normal" (restore/maximized), "fullscreen" (hide OS +
+        browser chrome). The state is remembered and RE-APPLIED automatically
+        the next time a fresh browser window is launched (the browser is left
+        open between runs; launching a new one resets window chrome).
+        """
+        wanted = str(state or "").strip().lower()
+        if wanted in {"", "normal", "maximize", "windowed", "restore"}:
+            wanted = ""
+        elif wanted in {"fullscreen", "f11", "full"}:
+            wanted = "fullscreen"
+        else:
+            raise ValueError("window_state must be 'normal' or 'fullscreen'")
+        self._window_state = wanted
+        applied = {"done": True, "window_state": wanted}
+        try:
+            browser = self._ensure_browser()
+            if hasattr(browser, "toggle_window_state"):
+                m = getattr(browser, "toggle_window_state")
+                # MERGE: the driver's result carries viewport/fullscreen detail
+                # but always keep our canonical "window_state" key.
+                applied = {**applied, **(m(wanted or "normal") or {})}
+                applied["window_state"] = wanted
+        except Exception as exc:
+            applied = {"done": False, "error": str(exc)[:200], "window_state": wanted}
+        return applied
+
     def _ensure_browser(self):
         if self._browser is not None and getattr(self._browser, "available", False):
             return self._browser
@@ -297,6 +373,7 @@ class AgentLoop:
             self._browser = self._browser_factory
             if not getattr(self._browser, "available", False):
                 self._browser.start()
+            self._reapply_window_state()
             return self._browser
         if self._browser is None:
             # One permanent owner thread for the driver (see BrowserThreadProxy):
@@ -307,7 +384,23 @@ class AgentLoop:
                 or (lambda: BrowserDriver(headless=False, profile_dir=str(self.root / "browser_profile")))
             )
         self._browser.start()
+        self._reapply_window_state()
         return self._browser
+
+    def _reapply_window_state(self) -> None:
+        """A freshly launched browser window loses any prior fullscreen —
+        remember and re-apply the user's choice once, after one start."""
+        if not self._window_state or self._window_state_requested:
+            return
+        self._window_state_requested = True
+        try:
+            applier = getattr(self._browser, "toggle_window_state", None)
+            if callable(applier):
+                applier(self._window_state)  # blocks until applied
+        except Exception:
+            # Smoke once more on the next fresh start (window may just have
+            # raced our call); never break the run over chrome.
+            self._window_state_requested = False
 
     def _shutdown_browser_if_owned(self) -> None:
         # Injected browsers (tests) are not closed by the loop.
@@ -338,6 +431,101 @@ class AgentLoop:
 
     # ------------------------------------------------------------ planning
 
+    # -- deterministic primitive plans -------------------------------------
+    # A local 3B/27B planner cannot reliably plan even a cube: the last live
+    # run replayed a stale "Create button at (109,66)" step inside an open
+    # document and burned 30 steps on pixel guesses while never emitting ONE
+    # target click. For goals that name a primitive solid, the plan is fully
+    # authored: every named-UI step is a target click the driver resolves
+    # against real DOM labels; only the two canvas corner clicks are pixel
+    # actions and even those are corrected by the user text hints.
+    _PRIMITIVE_GOAL_RE = re.compile(
+        r"\b(cube|box|block|square|rectangular\s+prism)\b", re.I
+    )
+
+    @classmethod
+    def _primitive_plan(cls, goal: str) -> list[dict[str, str]] | None:
+        """Authored step plan for primitive solid goals, or None.
+
+        Returns plan items in the same {step, expect} shape parse_plan emits,
+        so the run loop, plan advance logic and status reporting need no
+        changes. Only used when the page is ALREADY a workspace, documents-
+        list open-document steps stay under the planner's control.
+        """
+        text = str(goal or "")
+        if not cls._PRIMITIVE_GOAL_RE.search(text):
+            return None
+        # Size defaults: "10" in the text wins, else 10mm square x 10 deep.
+        numbers = [int(n) for n in re.findall(r"\b(\d{1,4})(?:\.\d+)?\b", text) if 0 < int(n) <= 2000]
+        size = numbers[0] if numbers else 10
+        steps = [
+            {
+                # Works FROM EITHER PAGE: the open-document act measures where
+                # we are (loop-side), the sketch act drives the workspace side.
+                "step": "open the Part Studio (most recent document, if on the documents list)",
+                "expect": "workspace URL /documents/<id>/w/<id>/e/<id>",
+                "acts": [{"action": "dblclick", "target": "recent document card", "reason": "authored: open document"}],
+                "only_if": "documents_list",
+            },
+            {
+                "step": "start a new sketch",
+                "expect": "sketch plane selection appears",
+                "acts": [{"action": "click", "target": "Sketch", "reason": "authored: open Sketch"}],
+            },
+            {
+                "step": "sketch on the Top plane",
+                "expect": "sketch opens on the Top plane",
+                "acts": [{"action": "click", "target": "Top", "reason": "authored: Top sketch plane"}],
+            },
+            {
+                "step": "pick the Corner rectangle tool",
+                "expect": "rectangle tool active",
+                "acts": [{"action": "click", "target": "Corner rectangle", "reason": "authored: rectangle tool"}],
+            },
+            {
+                "step": "place the first corner at the sketch origin (canvas center)",
+                "expect": "first corner set",
+                "acts": [{"action": "click", "origin": True, "reason": "authored: origin corner"}],
+            },
+            {
+                "step": "place the opposite corner down-right of the origin",
+                "expect": "rectangle drawn on the Top plane",
+                "acts": [{"action": "click", "origin": True, "dx": 170, "dy": 170, "reason": "authored: opposite corner"}],
+            },
+            {
+                "step": (
+                    f"finish the sketch with the green check; if a dimension is pending, "
+                    f"type {size} for it — the exact size comes right after via dimensions"
+                ),
+                "expect": "sketch finished, back in 3D view",
+                "acts": [{"action": "click", "target": "check", "reason": "authored: finish sketch"}],
+            },
+            {"step": f"dimension the bottom edge of the rectangle to {size} mm (click Dimension, click the bottom edge, place the dimension, type {size}, Enter)", "expect": "dimension value applied"},
+            {"step": f"dimension the side edge of the rectangle to {size} mm the same way", "expect": "both dimensions applied"},
+            {
+                "step": f"open Extrude and set the depth to {size} mm",
+                "expect": "extrude dialog opens with the depth field",
+                "acts": [
+                    {"action": "click", "target": "Extrude", "reason": "authored: open Extrude"},
+                    {"action": "click", "target": "Depth field", "reason": "authored: focus Depth"},
+                    {"action": "type", "text": str(size), "reason": "authored: depth value"},
+                    {"action": "key", "keys": ["enter"], "reason": "authored: commit depth"},
+                ],
+            },
+            {
+                "step": f"accept the extrude — depth {size} mm",
+                "expect": f"solid ~{size}x{size}x{size} block appears; Parts (1) in the tree",
+                "acts": [{"action": "click", "target": "check", "reason": "authored: accept extrude"}],
+            },
+            {
+                # The extrude may auto-accept when Enter commits the depth;
+                # an extra check click just confirms nothing new opens.
+                "step": "verify the part exists (Parts row in the tree)",
+                "expect": "Parts count is now 1",
+            },
+        ]
+        return steps
+
     def make_plan(
         self,
         goal: str,
@@ -351,6 +539,19 @@ class AgentLoop:
         goal = _clip(goal, 2000).strip()
         if not goal:
             raise ValueError("Goal is required")
+        # Deterministic authored plan for primitive solids (cube, box, square,
+        # plate): the planner was REPLACED by this when a goal matches, because
+        # the local model reused older plans with pixels from a different
+        # session while never using target clicks the driver understands.
+        page_l = (page_hint or "").lower()
+        workspace = "/documents/" in page_l and re.search(r"/e/", page_l)
+        prim = self._primitive_plan(goal)
+        if prim:
+            # The recipe now covers the documents list too (its first step
+            # opens the most recent document). On a workspace the open-
+            # document step is skipped at execution time via 'only_if'.
+            self._planner_model = "authored-recipe"
+            return prim
         text_model = resolve_planner_model(planner_model or "auto")
         if not text_model:
             raise OllamaError("No local Ollama model available for planning")
@@ -383,10 +584,21 @@ class AgentLoop:
         return plan
 
     def preview_plan(self, *, goal: str, model: str = "", planner_model: str = "") -> dict[str, Any]:
+        # Use the REAL browser page as the hint: /plan while the Part Studio
+        # is open must show the same authored recipe a run would use — not an
+        # LLM plan written for the documents list (the last live preview said
+        # "open a document" while the document was already open).
+        hint = ""
+        try:
+            browser = self._ensure_browser()
+            hint = f"{browser.title()} ({browser.url()})"
+        except Exception:
+            hint = ""
         plan = self.make_plan(
             goal,
             model=model,
             planner_model=planner_model,
+            page_hint=hint,
             memory_block=self.memory.prompt_block(goal),
         )
         return {"steps": plan, "count": len(plan), "planner_model": self._planner_model}
@@ -424,6 +636,7 @@ class AgentLoop:
             self._plan = []
             self._plan_i = 0
             self._pending_appeared = None
+            self._window_state_requested = False
             self._unstick_cycles = 0
             self._reloads_done = 0
             self._recent_signatures = []
@@ -473,23 +686,43 @@ class AgentLoop:
             models = []
         return prefer_vision_model(models) if models else "qwen2.5vl"
 
+    # Perceptual JPEG quality for frames sent to the vision model. 80 smoothed
+    # away thin Onshape overlays (dimension labels, hover outlines); 92 keeps
+    # them and is still far below the point where the VLM's context becomes
+    # the bottleneck.
+    VLM_JPEG_QUALITY = 92
+
     def _observe(self) -> tuple[str, dict[str, Any]]:
         browser = self._ensure_browser()
         png = browser.screenshot_png()
         # Send the screenshot at VIEWPORT resolution: the VLM answers in the
         # pixel space of the image it RECEIVES, so downscaling would silently
         # shrink every coordinate (verified live: clicks landed ~46% up-left).
-        b64 = encode_jpeg_b64(png, max_side=max(browser.viewport), quality=80)
+        b64 = encode_jpeg_b64(png, max_side=max(browser.viewport), quality=self.VLM_JPEG_QUALITY)
         obs = {"url": browser.url(), "title": browser.title()}
         self._last_browser_url = str(obs["url"] or "")
         return b64, obs
 
+    def _viewport_wh(self) -> tuple[int, int]:
+        """Current browser viewport (best-effort (1440,900) before it exists)."""
+        try:
+            vp = self._ensure_browser().viewport
+            return int(vp[0]), int(vp[1])
+        except Exception:
+            return 1440, 900
+
     def _user_text(self, goal: str, obs: dict[str, Any], memory_block: str, plan_line: str) -> str:
         recent = ", ".join(self._recent_signatures[-8:])
+        # The model must answer in the SAME pixel space the screenshot uses.
+        # After a viewport change (fullscreen on/off) the old hardcoded
+        # 1440x900 in the prompt made it emit coordinates beyond the real
+        # screen — clamped to (0,0)-ish garbage clicks.
+        vw, vh = self._viewport_wh()
         parts = [
             f"GOAL: {goal}",
             plan_line,
             f"Page: {obs.get('title') or 'Onshape'} ({obs.get('url') or ''})",
+            f"Screen: {vw}x{vh} pixels. Coordinates must be 0<x<{vw}, 0<y<{vh}.",
             f"Step: {self._step + 1}/{self._max_steps}.",
             f"Last action: {json.dumps(self._last_action)[:220] if self._last_action else '(none)'}",
             f"Last reason: {self._last_reason or '(none)'}",
@@ -607,6 +840,10 @@ class AgentLoop:
 
         memory_block = self.memory.prompt_block(goal) if run_mode == "learn" else ""
         consecutive_failures = 0
+        # Steps the current plan step has consumed; an author-free model step
+        # (canvas clicks/dimensions) that never advances must eventually be
+        # skipped — the live run burned 70 of 80 steps on ONE dimension step.
+        plan_step_started = 0
         last_url = ""
         last_ws = ""
         prev_sig: list[float] = []
@@ -687,6 +924,60 @@ class AgentLoop:
                 ):
                     self._plan_i += 1
             user_text = self._user_text(goal, obs, memory_block, plan_line)
+            # Authored recipe step: execute its acts DIRECTLY (target clicks the
+            # driver resolves against real DOM labels), no vision model in the
+            # loop — the model was the failure source. If all acts fail, fall
+            # through to the model for one recovery attempt.
+            authored = (
+                item.get("acts")
+                if self._mode == "plan" and self._plan and self._plan_i < len(self._plan) and isinstance(self._plan[self._plan_i].get("acts"), list)
+                else None
+            )
+            if authored:
+                # 'only_if': skip the (whole) step when its precondition is
+                # already satisfied — e.g. the open-document act is pointless
+                # (and HARMFUL: it would dblclick whatever is in the card
+                # position, likely the canvas) when we are ALREADY inside a
+                # Part Studio workspace.
+                if item.get("only_if") == "documents_list" and _doc_workspace_url(url_now):
+                    self._plan_i += 1
+                    self._detail = "Authored recipe: already inside a document — skipped open step"
+                    continue
+                self._status = "Running"
+                self._detail = f"Authored recipe: {item.get('step')}"
+                failed = False
+                for act in authored:
+                    if self._stop.is_set():
+                        return
+                    a = dict(act)
+                    if a.get("origin"):
+                        # driver.execute(origin=True) RESOLVES AND CLICKS in
+                        # one action — passing its result back as a pixel
+                        # click double-placed the corner (live bug: rectangle
+                        # started 170 px away from the origin).
+                        a = {"action": "click", "origin": True, "dx": int(a.get("dx") or 0), "dy": int(a.get("dy") or 0), "reason": a.get("reason") or ""}
+                    try:
+                        result = self._execute(a)
+                    except BrowserError as exc:
+                        self._error = str(exc)[:200]
+                        self._detail = self._error
+                        break
+                    self._last_action = a
+                    self._last_reason = str(a.get("reason") or "")[:120]
+                    self._step += 1
+                    self._log_step(a, obs)
+                    self._save_debug_shot(b64, self._step)
+                    if isinstance(result, dict) and result.get("done") is False:
+                        failed = True
+                        self._detail = f"Authored step '{item.get('step')}' act failed: {str(result.get('error') or '')[:120]}"
+                        break
+                    time.sleep(0.5)
+                if not failed:
+                    self._plan_i += 1
+                    self._pending_appeared = None
+                    time.sleep(0.3)
+                    continue
+                # fall through to the model for recovery below
             try:
                 raw = chat_vision_json(
                     vision_model,
@@ -708,6 +999,24 @@ class AgentLoop:
                 time.sleep(0.6)
                 continue
 
+            # --- garbage-output gate -------------------------------------
+            # Live failure: the model degenerated into clicks at (0,0)/(0,10)
+            # (the corner, harmless-but-random) and repeated 'type' spam. A
+            # real Onshape target is NEVER in the top-left 12x12 corner —
+            # that whole strip is the browser/OS chrome in the screenshot.
+            # Rejecting those actions costs one step; executing them cost a
+            # hundred. Also clamp impossibly out-of-screen coords instead of
+            # letting driver clamping turn them into corner clicks.
+            action, rejected = _sanitize_action(action, self._viewport_wh())
+            if rejected:
+                self._last_action = action
+                self._last_reason = rejected
+                self._step += 1
+                self._log_step({**action, "reason": rejected}, obs)
+                self._detail = f"Model emitted invalid action — {rejected}"
+                time.sleep(0.2)
+                continue
+
             # Anti-repeat: identical signature 3x in a row -> inject a nudge.
             sig = action_signature(action)
             if sig:
@@ -715,7 +1024,7 @@ class AgentLoop:
                 self._recent_signatures = self._recent_signatures[-40:]
                 if len(self._recent_signatures) >= 3 and self._recent_signatures[-3:] == [sig] * 3:
                     action["reason"] = (action.get("reason") or "") + " [blocked repeat]"
-                    action = self._break_repeat(action, sig)
+                    action = self._break_repeat(action, sig, self._viewport_wh())
 
             # Models often narrate "double-click ..." while emitting a plain
             # click; Onshape cards only open on a real dblclick — honor intent.
@@ -725,26 +1034,40 @@ class AgentLoop:
             ):
                 action["action"] = "dblclick"
 
-            if static_steps >= 6 and action.get("action") != "stop":
+            if static_steps >= 8 and action.get("action") != "stop":
                 static_steps = 0
                 self._unstick_cycles += 1
-                if self._unstick_cycles >= 2 and self._reloads_done < _MAX_PAGE_RELOADS:
-                    # Two Esc rounds changed nothing: the page is alive but
-                    # its click handlers are dead (observed live — hover and
-                    # native tooltips worked while every click no-opped).
-                    # Esc can never fix that; a reload can.
-                    self._reloads_done += 1
-                    self._unstick_cycles = 0
-                    action = {
-                        "action": "hotkey",
-                        "keys": ["ctrl", "r"],
-                        "reason": "unstick: reload after Esc made no change",
-                    }
-                else:
+                # Escalation ladder (tuned after live run: reload was firing
+                # every ~15 steps and blinking the whole session away):
+                #   cycle 1: Esc (closes stray menu/dialog)
+                #   cycle 2: reload — ONCE per run, dead-handlers fix
+                #   cycle 3+: STOP waiting — a static screen is not progress
+                #             and a mid-plan wait-spam burned 50 of 80 steps
+                #             (live: the run did nothing for its final 55
+                #             steps after the viewport clicked itself into a
+                #             zoomed-out corner). Hand control back to the
+                #             model with a blunt instruction instead.
+                if self._unstick_cycles == 1:
                     action = {
                         "action": "key",
                         "keys": ["esc"],
-                        "reason": "unstick: screen unchanged for 6 steps",
+                        "reason": "unstick: screen unchanged for 8 steps",
+                    }
+                elif self._unstick_cycles == 2 and self._reloads_done < _MAX_PAGE_RELOADS:
+                    self._reloads_done += 1
+                    action = {
+                        "action": "hotkey",
+                        "keys": ["ctrl", "r"],
+                        "reason": "unstick: reload once after Esc made no change",
+                    }
+                else:
+                    # Repeat-driver for a mid-plan stuck model: RE-EMIT the
+                    # current plan step's next authored act instead of
+                    # waiting forever. A pure wait-loop can never recover.
+                    action = {
+                        "action": "wait",
+                        "seconds": 1.2,
+                        "reason": "unstick: screen static — re-observe, then retry the current plan step with a DIFFERENT approach",
                     }
 
             try:
@@ -759,6 +1082,21 @@ class AgentLoop:
             self._step += 1
             self._log_step(action, obs)
             self._save_debug_shot(b64, self._step)
+
+            # Stuck-plan-step breaker: a single plan step may consume at most
+            # _MAX_STEPS_PER_PLAN_MODEL steps of model-driven (non-authored)
+            # actions. The live run spent 70 of 80 steps on one dimension
+            # step and never reached Extrude. Skipping costs nothing when the
+            # step was actually done (the plan advances on 'step done');
+            # it unblocks the run when the model simply cannot click a
+            # sketch edge that frame.
+            if self._mode == "plan" and self._plan and self._plan_i < len(self._plan):
+                if plan_step_started == 0:
+                    plan_step_started = self._step
+                elif self._step - plan_step_started > 12:
+                    self._plan_i += 1
+                    plan_step_started = self._step
+                    self._detail = "Plan step stuck — skipping ahead (model could not complete it)"
 
             if action.get("action") == "stop" or (isinstance(result, dict) and result.get("stop")):
                 self._detail = f"Goal reported complete: {action.get('reason') or goal}"
@@ -780,12 +1118,15 @@ class AgentLoop:
                     or overlap
                 ):
                     self._plan_i += 1
+                    plan_step_started = self._step
                 elif action.get("action") in {"wait"} and "next step" in reason_l:
                     self._plan_i += 1
+                    plan_step_started = self._step
                 elif entered_doc and "open" in (expect_l + step_l):
                     # Deterministic outcome: the list -> workspace transition
                     # means the document opened, whatever the model said.
                     self._plan_i += 1
+                    plan_step_started = self._step
                 elif any(w in expect_l for w in ("menu", "dropdown", "dialog", "overlay")):
                     # The expect says an overlay APPEARS. Defer to the next
                     # frame: a large pixel change right after this action
@@ -794,7 +1135,11 @@ class AgentLoop:
                     self._pending_appeared = (self._plan_i, frame_sig)
             last_url = url_now
 
-            time.sleep(0.12)
+            # Let Onshape actually process + redraw the action before we
+            # observe again. 0.12s was fast enough to race the SPA: the next
+            # screenshot showed the PRE-action screen, the model saw "nothing
+            # happened" and started its panic loop (spurious Esc/reloads).
+            time.sleep(0.45)
 
         if not self._stop.is_set() and self._step >= max_steps:
             self._detail = f"Step budget exhausted ({max_steps})"
@@ -802,29 +1147,43 @@ class AgentLoop:
             self._status = "Stopped"
             self._detail = "Stopped by user"
 
-    def _break_repeat(self, action: dict[str, Any], sig: str) -> dict[str, Any]:
-        """Nudge a stuck model: waits become clicks elsewhere, clicks get displaced."""
+    def _break_repeat(self, action: dict[str, Any], sig: str, vp: tuple[int, int]) -> dict[str, Any]:
+        """Nudge a stuck model WITHOUT corrupting coordinates.
+
+        The old nudge displaced clicks ±24 px EVERY time the signature
+        repeated — against a degenerate (0,10) click that just moved the
+        corner-click around for 40 steps. Now: clicks are sent for a
+        mid-viewport refocus only after a key/hotkey repeat, and a repeated
+        'type' is turned into a real re-observe pause with a hint, not
+        another blind type.
+        """
         kind = action.get("action")
         if kind == "wait":
             return {"action": "key", "keys": ["escape"], "reason": "break repeat: close menu"}
+        if kind == "type":
+            # Repeated identical 'type' means the tool never activated (no
+            # sketch open / nothing selected). Pause + explicit hint beat
+            # typing the same string a 4th time.
+            return {
+                "action": "wait",
+                "seconds": 0.6,
+                "reason": "break repeat: same command re-sent with no effect — search for it or set the precondition first",
+            }
         if kind in {"click", "dblclick"}:
-            # Displace RANDOMLY around the ORIGINAL point — a cumulative walk
-            # marched the cursor into the Onshape logo and navigated away.
-            # Keep the nudge SMALL: menu rows are ~30 px tall, and ±70 knocked
-            # near-correct clicks off the "New document" item entirely.
-            ox = int(action.get("x") or 0)
-            oy = int(action.get("y") or 0)
-            action["x"] = max(0, ox + (random.randint(-24, 24) or 14))
-            action["y"] = max(0, oy + (random.randint(-18, 18) or 10))
-            action["reason"] = "retry displaced from repeated miss"
+            # DON'T displace coordinates (that created the random-walk).
+            # Re-run the SAME click once — if it truly is the right target,
+            # the repetition may have been a registration race; the signature
+            # guard elsewhere prevents an endless loop of them.
+            action["reason"] = "retry same click once (repeat guard)"
             return action
         if kind in {"key", "hotkey"}:
-            return {"action": "click", "x": 720, "y": 450, "reason": "break repeat: refocus viewport"}
-        if kind == "type":
-            # The driver routes no-focus typing through the S search; if the
-            # model STILL re-sends the identical type, pause and re-observe
-            # rather than pressing keys that fight the model's own Esc/S.
-            return {"action": "wait", "seconds": 0.4, "reason": "break repeat: type re-sent — re-observe before retrying"}
+            vw, vh = vp
+            return {
+                "action": "click",
+                "x": int(vw * 0.45),
+                "y": int(vh * 0.5),
+                "reason": "break repeat: refocus viewport center",
+            }
         return action
 
     def _log_step(self, action: dict[str, Any], obs: dict[str, Any]) -> None:

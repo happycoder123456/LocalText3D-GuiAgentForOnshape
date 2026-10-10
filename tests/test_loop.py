@@ -259,10 +259,10 @@ class LoopLifecycleTests(unittest.TestCase):
         self.assertEqual(len(shots), 1)
 
     def test_make_plan_includes_page_hint(self):
-        raw = json.dumps({"plan": [{"step": "open the most recent document", "expect": ""}]})
+        raw = json.dumps({"plan": [{"step": "model a gear", "expect": ""}]})
         with mock.patch("agent.loop.chat_text_json", return_value=raw) as chat:
             plan = self.loop.make_plan(
-                "make a cube",
+                "model a gear",
                 planner_model="test-model",
                 page_hint="Owned by me | Documents (https://cad.onshape.com/documents)",
             )
@@ -332,16 +332,41 @@ class LoopLifecycleTests(unittest.TestCase):
 
     def test_make_plan_marks_workspace_context(self):
         # Live bug: plan said "create document" while ALREADY inside one.
-        raw = json.dumps({"plan": [{"step": "sketch a square", "expect": ""}]})
+        # Non-primitive goals still go to the planner with the context rules.
+        raw = json.dumps({"plan": [{"step": "sketch a gear", "expect": ""}]})
         with mock.patch("agent.loop.chat_text_json", return_value=raw) as chat:
             self.loop.make_plan(
-                "make a cube",
+                "make a gear",
                 planner_model="test-model",
                 page_hint="Part Studio (https://cad.onshape.com/documents/533/tw/x/e/y)",
             )
         user = chat.call_args.kwargs["user_text"]
         self.assertIn("do NOT plan any create-document", user)
         self.assertIn("click a plane", user)
+
+    def test_primitive_goal_uses_authored_plan_never_planner(self):
+        # The live failure behind this: the planner replayed stale pixel steps
+        # ("Create button at 109,66") inside an open document and the model
+        # never emitted ONE target click. "make me a simple cube" inside a
+        # workspace must be planned deterministically — the LLM planner is
+        # never even called, and every named-UI step carries direct acts.
+        raw = json.dumps({"plan": [{"step": "planner must not be used", "expect": ""}]})
+        with mock.patch("agent.loop.chat_text_json", side_effect=AssertionError("planner called")):
+            plan = self.loop.make_plan(
+                "make me a simple cube",
+                planner_model="test-model",
+                page_hint="Part Studio (https://cad.onshape.com/documents/533/tw/x/e/y)",
+            )
+        self.assertGreaterEqual(len(plan), 8)
+        # Canvas-edge clicks need live pixels (screenshot-driven), so they stay
+        # model steps; every named-UI control MUST be an authored target act.
+        authored = [it for it in plan if it.get("acts")]
+        self.assertGreaterEqual(len(authored), 7, "named-UI steps must be authored")
+        targets = [a.get("target") for it in authored for a in it["acts"] if a.get("target")]
+        self.assertIn("Sketch", targets)
+        self.assertIn("Top", targets)
+        self.assertIn("Extrude", targets)
+        self.assertEqual(self.loop._planner_model, "authored-recipe")
 
     def test_user_text_flags_stuck_repeats(self):
         # Live bug: 104 of 200 steps were identical no-op repeats; the next
@@ -356,10 +381,10 @@ class LoopLifecycleTests(unittest.TestCase):
         self.assertNotIn("STUCK", text2)
 
     def test_make_plan_includes_memory_block(self):
-        raw = json.dumps({"plan": [{"step": "sketch a square", "expect": ""}]})
+        raw = json.dumps({"plan": [{"step": "sketch a gear", "expect": ""}]})
         with mock.patch("agent.loop.chat_text_json", return_value=raw) as chat:
             plan = self.loop.make_plan(
-                "make a cube",
+                "model a gear",
                 planner_model="test-model",
                 memory_block="TECHNIQUE 'line': draw a line — do: s -> \"line\" -> Enter",
             )
@@ -367,6 +392,24 @@ class LoopLifecycleTests(unittest.TestCase):
         user = chat.call_args.kwargs["user_text"]
         self.assertIn("Known techniques", user)
         self.assertIn("TECHNIQUE 'line'", user)
+
+    def test_primitive_plan_from_documents_list_opens_document_first(self):
+        # "make a cube" from the DOCUMENTS LIST must produce the authored
+        # recipe whose FIRST act opens the most recent document — the LLM
+        # planner stayed the fallback (live: it clicked (109,66) on a
+        # different layout and never opened a document).
+        plan = self.loop.make_plan(
+            "make a simple cube",
+            planner_model="test-model",
+            page_hint="Owned by me | Documents (https://cad.onshape.com/documents)",
+        )
+        first = plan[0]
+        self.assertIn("acts", first)
+        act = first["acts"][0]
+        self.assertEqual(act["action"], "dblclick")
+        self.assertIn("document card", str(act.get("target")))
+        # and the open step is marked to be skipped inside a workspace
+        self.assertEqual(first.get("only_if"), "documents_list")
 
     def test_click_narrating_double_click_becomes_dblclick(self):
         with mock.patch(
@@ -446,7 +489,8 @@ class LoopLifecycleTests(unittest.TestCase):
         self.assertEqual(calls["n"], 3)
         self.assertEqual(browser.current_url, ws)
 
-    def test_repeat_click_displaced_near_original(self):
+    def test_repeat_click_2nd_retried_at_same_point(self):
+        """Retrying at the exact same point (repeat-guard hint replaces the old displacement)."""
         responses = iter(
             [
                 _fake_vision_response({"action": "click", "x": 400, "y": 300, "reason": "a"}),
@@ -459,13 +503,13 @@ class LoopLifecycleTests(unittest.TestCase):
             self.loop.start_run(goal="stuck", model="test-model", use_plan=False, max_steps=8)
             self.assertTrue(_wait_until(lambda: not self.loop.busy()))
         clicks = [a for a in self.loop._browser.actions if a["action"] in {"click", "dblclick"}]
-        self.assertEqual(len(clicks), 3)
-        third = clicks[2]
-        # Third identical click is nudged — but stays NEAR the original point
-        # (a cumulative walk once dragged the cursor into the Onshape logo).
-        self.assertNotEqual((third["x"], third["y"]), (400, 300))
-        self.assertLessEqual(abs(third["x"] - 400), 70)
-        self.assertLessEqual(abs(third["y"] - 300), 50)
+        # First run is retried once at the SAME point (registration race);
+        # stop is always honored so we can exit the run right after.
+        self.assertEqual(len(clicks), 3, f"2 or 3 identical clicks expected, got {len(clicks)}")
+        for c in clicks:
+            # No cumulative random walk: stay NEAR the original point.
+            self.assertLessEqual(abs(c["x"] - 400), 70)
+            self.assertLessEqual(abs(c["y"] - 300), 50)
 
     def test_repeated_type_nudged_to_refocus(self):
         responses = iter(
@@ -657,9 +701,10 @@ class LoopLifecycleTests(unittest.TestCase):
             for a in acts
             if a["action"] == "hotkey" and a.get("keys") == ["ctrl", "r"]
         ]
-        # Esc@7, reload@13, Esc@19, reload@25, Esc@31, reload@37 — then cap.
+        # Esc@8, then one capped reload (each cycle only ONCE per run, not
+        # re-fired forever — see the new escalation ladder in loop.py).
         self.assertTrue(escs, "the first unstick cycle must still press Esc")
-        self.assertEqual(len(reloads), 3, f"expected 3 capped reloads, got {len(reloads)}")
+        self.assertEqual(len(reloads), 1, f"expected exactly 1 capped reload, got {len(reloads)}")
         # Reload must come only AFTER a failed Esc round, never first.
         first_esc = next(i for i, a in enumerate(acts) if a["action"] == "key" and a.get("keys") == ["esc"])
         first_reload = next(
@@ -684,13 +729,12 @@ class LoopLifecycleTests(unittest.TestCase):
             self.loop.start_run(goal="menu click", model="test-model", use_plan=False, max_steps=8)
             self.assertTrue(_wait_until(lambda: not self.loop.busy()))
         clicks = [a for a in self.loop._browser.actions if a["action"] == "click"]
-        self.assertEqual(len(clicks), 3)
-        displaced = [a for a in clicks if "displaced" in str(a.get("reason") or "")]
-        self.assertEqual(len(displaced), 1, "the 3rd identical click must be displaced")
-        d = displaced[0]
-        self.assertLessEqual(abs(d["x"] - 104), 24)
-        self.assertLessEqual(abs(d["y"] - 63), 18)
-        self.assertNotEqual((d["x"], d["y"]), (104, 63))
+        # In the new design, click #2 is simply retried at the SAME point
+        # (registration race), and the bump happens only when the model goes
+        # into a longer loop with no visible change. Assert no walk-away:
+        for c in clicks:
+            self.assertLessEqual(abs(c["x"] - 104), 70)
+            self.assertLessEqual(abs(c["y"] - 63), 50)
 
     def test_doc_workspace_url_detection(self):
         from agent.loop import _doc_workspace_url

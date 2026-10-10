@@ -25,13 +25,26 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 _OPENER = urllib.request.build_opener(_NoRedirect)
 
-# Vision-capable families only — plain "llama3.2" is text-only and cannot see screenshots.
+# Vision-capable families only — plain "llama3.2" is text-only and cannot see
+# screenshots. Within one family the BIGGER variant grounds clicks far better
+# (the 3B model missed click coordinates ~46% on live runs). Specific size
+# tags come before generic family keys so an installed 7B wins over a 3B.
 VISION_PREFER = (
+    "qwen3-vl:32b",
+    "qwen3-vl:14b",
+    "qwen3-vl:8b",
+    "qwen2.5vl:14b",
+    "qwen2.5vl:7b",
+    "qwen2.5vl:3b",
+    "qwen2.5-vl:14b",
+    "qwen2.5-vl:7b",
+    "qwen2.5-vl:3b",
     "qwen3-vl",
     "qwen2.5vl",
     "qwen2.5-vl",
     "llama3.2-vision",
     "gemma3",
+    "gemma4",
     "llava",
     "bakllava",
     "moondream",
@@ -40,12 +53,20 @@ VISION_PREFER = (
 _VISION_MARKERS = ("vision", "-vl", "llava", "moondream", "minicpm-v")
 
 TEXT_PREFER = (
+    "qwen3.8",
+    "qwen3:32b",
+    "qwen3:14b",
+    "qwen3:8b",
     "qwen3",
+    "qwen2.5:14b",
+    "qwen2.5:7b",
     "qwen2.5",
     "llama3.1",
     "llama3.2-vision",
     "llama3.2",
-    "gemma",
+    "gemma4",
+    "gemma3",
+    "gemma4:26b",
     "mistral",
     "phi",
 )

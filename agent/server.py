@@ -195,6 +195,10 @@ class AgentHandler(BaseHTTPRequestHandler):
                 )
                 self._send(200, {"ok": True, **self.loop.status()})
                 return
+            if parsed.path == "/browser/window":
+                applied = self.loop.set_window_state(str(body.get("state") or ""))
+                self._send(200, {"ok": True, "applied": applied, **self.loop.status()})
+                return
             if parsed.path == "/agent/stop":
                 self.loop.stop()
                 self._send(200, {"ok": True, **self.loop.status()})

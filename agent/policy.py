@@ -49,6 +49,7 @@ Onshape facts:
 - Learn from MEMORY: copy SUCCESS / teacher patterns; never repeat AVOID or BANNED actions.
 - A MEMORY "TECHNIQUE ... — do:" line is a HINT, not a script: run it only when its precondition is already visible (a sketch open, geometry selected). If a technique has no recipe, reach for the visible toolbar button instead.
 - NEVER type a bare noun ("rectangle", "fillet") with nothing selected and no sketch open — that produces no change. Set the precondition first.
+- The agent ALSO supports clicking by label: emit {"action":"click","target":"Sketch"} (also "Extrude", "Top", "Front", "Right", "Corner rectangle", "Dimension", "Origin") INSTEAD of x,y when the target is a named toolbar button, feature-tree item, dialog field, or plane. "target" clicks are resolved against the REAL page (aria/tooltip labels) and are far more reliable than pixel guesses — always prefer target for named UI, pixels only for canvas/geometric clicks.
 - If last reward was negative, change click target AND approach — do not nudge the same miss.
 - stop only when the goal is visibly done in the viewport (feature exists in the tree, shape looks right).
 """
@@ -62,6 +63,7 @@ Rules:
 - Prefer the S shortcut search over hunting through menus.
 - Numeric values go in the step text (for example "extrude 20 mm").
 - When a "Known techniques" block is supplied, reuse its wording for steps it clearly covers — but write each step as a GUI action with its precondition satisfied. Never paste a technique's raw keystroke recipe into the plan, and never plan a tool before the sketch/selection it needs.
+- PREFER named steps the vision model can satisfy with a "target" click (Sketch, Extrude, Top plane, Origin, Corner rectangle, Dimension, green check) over pixel-only instructions.
 - If a listed technique covers something you are about to repeat (patterning, mirroring, filleting several edges), USE that technique instead of re-drawing or re-feature-ing each copy by hand — that is why it was taught to you, and it keeps the plan inside 14 steps.
 - No markdown, no commentary outside the JSON.
 """

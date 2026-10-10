@@ -442,5 +442,30 @@ class FakeBrowserTests(unittest.TestCase):
         self.assertIn("playwright install", str(ctx.exception))
 
 
+class FakeBrowserFullscreenTests(unittest.TestCase):
+    """The GUI/fullscreen bridge must work for both real and Fake drivers."""
+
+    def test_fake_browser_toggles_and_restores(self):
+        from agent.browser import FakeBrowser
+
+        fake = FakeBrowser()
+        out = fake.toggle_window_state("fullscreen")
+        self.assertTrue(out["done"])
+        self.assertTrue(fake.fullscreen)
+        out = fake.toggle_window_state("normal")
+        self.assertTrue(out["done"])
+        self.assertFalse(fake.fullscreen)
+        self.assertEqual(fake.viewport, (1440, 900))
+
+    def test_fake_browser_state_strings(self):
+        from agent.browser import FakeBrowser
+
+        fake = FakeBrowser()
+        fake.set_fullscreen(True)
+        self.assertTrue(fake.fullscreen)
+        fake.set_fullscreen(False)
+        self.assertFalse(fake.fullscreen)
+
+
 if __name__ == "__main__":
     unittest.main()

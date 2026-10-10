@@ -25,6 +25,11 @@ DEFAULT_START_URL = "https://cad.onshape.com/documents"
 
 MAX_VIEWPORT = 7680  # 8K guard for silly model coordinates
 
+# Hard cap for the viewport passed to the VLM: qwen2.5vl runners keep entire
+# screenshots resident per image slot; 2 Megapixel is plenty to read Onshape's
+# UI text and stays within every local runner's image budget.
+VLM_CAPTURE_MAX = (1920, 1200)
+
 
 class BrowserError(Exception):
     pass
@@ -200,6 +205,8 @@ class BrowserDriver:
         self._page = None
         self._captured: list[dict[str, Any]] = []
         self._capture_installed = False
+        self._prev_viewport: tuple[int, int] | None = None
+        self.fullscreen = False
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -362,6 +369,79 @@ class BrowserDriver:
         self._maybe_save_cookies()
         return page.screenshot(type="png")
 
+    @staticmethod
+    def _screen_size() -> tuple[int, int]:
+        """Primary monitor size in pixels (best-effort; falls back to 1920x1080)."""
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            user32.SetProcessDPIAware()
+            return int(user32.GetSystemMetrics(0)), int(user32.GetSystemMetrics(1))
+        except Exception:
+            return 1920, 1080
+
+    def set_fullscreen(self, on: bool) -> dict[str, Any]:
+        """Put the OS browser window into true fullscreen (F11-equivalent).
+
+        document.requestFullscreen() from a SCRIPT is rejected by Chrome (it
+        needs a real user gesture) — that was the live failure: the window
+        LOOKED wider but the page still rendered in the old 1440x900 box at
+        the top-left, and every click coordinate was off.
+
+        The reliable path is the Chrome DevTools Protocol, which Playwright
+        already holds: CDP Browser.getWindowForTarget + Browser.setWindowBounds
+        with windowState:'fullscreen' (and 'normal' to exit). The viewport is
+        also resized to the monitor so Onshape's canvas — and the screenshot
+        the vision model receives — span the whole screen, keeping model
+        coordinates true.
+        """
+        page = self._require_page()
+        try:
+            cdp = page.context.new_cdp_session(page)
+            try:
+                if on:
+                    w, h = self._screen_size()
+                    self._prev_viewport = self._prev_viewport or self.viewport
+                    window_id = cdp.send("Browser.getWindowForTarget").get("windowId")
+                    cdp.send(
+                        "Browser.setWindowBounds",
+                        {"windowId": window_id, "bounds": {"windowState": "fullscreen"}},
+                    )
+                    try:
+                        page.set_viewport_size({"width": w, "height": h})
+                    except Exception:
+                        pass  # CDP fullscreen may already size the page
+                    self.viewport = (w, h)
+                else:
+                    prev = self._prev_viewport or self.viewport
+                    try:
+                        window_id = cdp.send("Browser.getWindowForTarget").get("windowId")
+                        cdp.send(
+                            "Browser.setWindowBounds",
+                            {"windowId": window_id, "bounds": {"windowState": "normal"}},
+                        )
+                    except Exception:
+                        pass  # viewport restore still applies
+                    try:
+                        page.set_viewport_size({"width": prev[0], "height": prev[1]})
+                    except Exception:
+                        pass
+                    self.viewport = (int(prev[0]), int(prev[1]))
+            finally:
+                try:
+                    cdp.detach()
+                except Exception:
+                    pass
+        except Exception as exc:
+            return {"done": False, "error": f"fullscreen: {str(exc)[:120]}"}
+        self.fullscreen = bool(on)
+        return {"done": True, "fullscreen": self.fullscreen, "viewport": list(self.viewport)}
+
+    def toggle_window_state(self, state: str) -> dict[str, Any]:
+        """Apply a window state: 'fullscreen' / 'full' / 'f11' or anything else = normal."""
+        return self.set_fullscreen(str(state or "").strip().lower() in {"fullscreen", "f11", "full"})
+
     def url(self) -> str:
         if self._page is None:
             return ""
@@ -396,6 +476,147 @@ class BrowserDriver:
             raise BrowserError("Browser is not started")
         return self._page
 
+    # JS that finds a visible element by its tooltip/aria label text.
+    # Onshape (Bootstrap 5 tooltips) labels every toolbar button and
+    # feature-tree item with data-bs-original-title — the SAME text used in
+    # our ." findable "click Sketch"-style prompts. Matches: exact first,
+    # then startswith, then contains (case-insensitive); index i picks a
+    # duplicate when several match (0 = first, -1 = last).
+    _FIND_BY_LABEL_JS = """
+    ({label, mode, i}) => {
+      const lc = label.toLowerCase();
+      const els = Array.from(document.querySelectorAll(
+        '[data-bs-original-title],[data-original-title],[title],[aria-label]'));
+      const vh = (window.innerHeight || 900);
+      let matches = els.filter(e => {
+        const g = e.getBoundingClientRect();
+        if (g.width < 4 || g.height < 4 || g.width > 480 || g.height > 240) return false;
+        if (g.bottom < 0 || g.right < 0) return false;
+        const t = (e.getAttribute('data-bs-original-title')
+          || e.getAttribute('data-original-title')
+          || e.getAttribute('title')
+          || e.getAttribute('aria-label') || '').trim().toLowerCase();
+        if (!t) return false;
+        if (e.getAttribute('aria-label') === t && e.getAttribute('aria-hidden') === 'true') return false;
+        /* LIVE FAILURE: asking for 'Sketch' matched the feature-tree rows
+           'Sketch 1 did not regenerate properly: Se' (contains) and clicked
+           one of THEM. Toolbar commands must only match the toolbar row:
+           when the label names a tool, elements low in the left tree (with
+           ' did not regenerate' noise) are excluded. */
+        const isToolQuery = /^(sketch|extrude|revolve|line|corner rectangle|dimension|fillet|loft|sweep)$/.test(lc)
+          || lc.startsWith("corner ") || lc.startsWith("center point");
+        if (isToolQuery && (g.y > vh * 0.25 || t.includes("did not regenerate"))) return false;
+        /* Retry-visibility: feature-tree rows scroll out of view after the
+           tree grows (28 features put the Top plane at y=-59). scrollIntoView
+           brings the row back into the viewport so the mouse click lands —
+           but NOT for tool queries (they must live in the toolbar row). */
+        const vw = (window.innerWidth || 1440);
+        if (g.y < 0 || g.x < 0 || g.y > vh || g.x > vw) {
+          if (!isToolQuery) {
+            try { e.scrollIntoView({block: 'center', behavior: 'instant'}); } catch (_) {}
+          }
+        }
+        const g2 = e.getBoundingClientRect();
+        if (g2.y < 0 || g2.x < 0 || g2.y > vh || g2.x > vw) return false;
+        if (mode === 'exact') return t === lc;
+        if (mode === 'starts') return t.startsWith(lc);
+        return t.includes(lc);
+      });
+      /* mostly-hidden parents (aria-hidden overlays, dialogs) can carry
+         duplicate labels — keep those with a real on-screen box */
+      if (!matches.length) return null;
+      const pick = i < 0 ? matches[matches.length - 1] : matches[Math.min(i, matches.length - 1)];
+      const r = pick.getBoundingClientRect();
+      if (r.width < 4 || r.height < 4) return null;
+      return {x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2),
+              w: Math.round(r.width), h: Math.round(r.height),
+              n: matches.length,
+              label: (pick.getAttribute('data-bs-original-title')
+                || pick.getAttribute('data-original-title')
+                || pick.getAttribute('title')
+                || pick.getAttribute('aria-label') || '').trim()};
+    }
+    """
+
+    def _click_by_label(self, page: Any, label: str, index: Any = None) -> dict[str, Any] | None:
+        """Resolve 'Sketch'/'Extrude'/'Top plane'... to the real element and click it.
+
+        Returns {'clicked': [x, y], 'label': actual} on success, or None when
+        no matching visible element exists (caller falls back to pixel click).
+        Prefer the tightest label match; fall back through exact->starts->has.
+        """
+        label = str(label or "").strip()
+        if not label:
+            return None
+        try:
+            idx = int(index) if index is not None else 0
+        except (TypeError, ValueError):
+            idx = 0
+        last_err: Exception | None = None
+        for mode in ("exact", "starts", "has"):
+            try:
+                found = page.evaluate(
+                    self._FIND_BY_LABEL_JS, {"label": label, "mode": mode, "i": idx}
+                )
+            except Exception as exc:  # page navigating/closed mid-evaluate
+                last_err = exc
+                found = None
+            if found and found.get("x") is not None:
+                x, y = int(found["x"]), int(found["y"])
+                try:
+                    page.mouse.click(x, y)
+                    return {
+                        "clicked": [x, y],
+                        "label": str(found.get("label") or label)[:40],
+                        "via": "dom-label",
+                        "matches": int(found.get("n") or 1),
+                    }
+                except Exception as exc:
+                    last_err = exc
+        return None
+
+    _FIND_DIALOG_CHECK_JS = """
+    () => {
+      /* The active feature dialog header carries TWO icon buttons right of
+         the title input: green check (left) and red X (right) — 28-px svgs.
+         Onshape gives them no label, so find them by position: the svg pair
+         sits above the dialog body; check is the LEFT one of the pair. */
+      const svgs = Array.from(document.querySelectorAll('svg, img'))
+        .map(e => ({e, r: e.getBoundingClientRect()}))
+        .filter(({r}) => r.width >= 16 && r.width <= 40 && r.height >= 16 && r.height <= 40
+          && r.top >= 40 && r.top <= 260 && r.left >= 120 && r.left <= 700);
+      svgs.sort((a, b) => (a.r.top - b.r.top) || (a.r.left - b.r.left));
+      // pair = two icons on the SAME row within 40 px of each other
+      for (let k = 0; k + 1 < svgs.length; k++) {
+        const a = svgs[k], b = svgs[k + 1];
+        if (Math.abs(a.r.top - b.r.top) <= 6 && (b.r.left - a.r.left) <= 44) {
+          const row = a.r;
+          return {x: Math.round(row.x + row.width / 2), y: Math.round(row.y + row.height / 2)};
+        }
+      }
+      return null;
+    }
+    """
+
+    _FIND_DOCUMENT_CARD_JS = """
+    () => {
+      /* Documents list: cards under 'Last opened by me' have the doc name in
+         .document-list-item-name (verified live); click target = the card
+         ancestor that is taller than the name row. */
+      const name = document.querySelector('.document-list-item-name');
+      if (!name) return null;
+      let r = name.getBoundingClientRect();
+      if (r.width < 4) return null;
+      let t = name;
+      for (let i = 0; i < 4 && t.parentElement; i++) {
+        t = t.parentElement;
+        const rr = t.getBoundingClientRect();
+        if (rr.height > r.height + 20) { r = rr; break; }
+      }
+      return {x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2)};
+    }
+    """
+
     # -- actions -----------------------------------------------------------
 
     def execute(self, action: dict[str, Any], *, stop_check=None) -> dict[str, Any]:
@@ -411,6 +632,80 @@ class BrowserDriver:
             # Out-of-viewport clicks are model misses; clamp instead of crashing.
             x = max(0, min(self.viewport[0] - 1, x))
             y = max(0, min(self.viewport[1] - 1, y))
+
+        if action.get("origin") and kind == "click":
+            # Authored recipe: click the sketch ORIGIN (canvas centre marker).
+            pt: dict[str, Any] = {}
+            try:
+                pt = page.evaluate(self._FIND_ORIGIN_JS) or {}
+            except Exception:
+                pt = {}  # canvas centre fallback below still lands a corner
+            ox = int(pt.get("x") or (self.viewport[0] // 2))
+            oy = int(pt.get("y") or (self.viewport[1] // 2))
+            ox += int(action.get("dx") or 0)
+            oy += int(action.get("dy") or 0)
+            ox = max(0, min(self.viewport[0] - 1, ox))
+            oy = max(0, min(self.viewport[1] - 1, oy))
+            page.mouse.click(ox, oy)
+            return {"done": True, "clicked": [ox, oy], "via": str(pt.get("via") or "center-fallback")}
+
+        if kind in ("click", "dblclick") and action.get("target"):
+            # DOM-first path: resolve the click by the element's tooltip
+            # label (Onshape marks every toolbar button / feature-tree item
+            # with data-bs-original-title='Sketch', 'Extrude', 'Top', ...).
+            # Pixel clicks cannot do this reliably; label clicks can.
+            tgt = str(action["target"]).strip()
+            if tgt.lower().startswith("recent document card"):
+                # Authored 'open the Part Studio' act on the documents list:
+                # cards open ONLY on a real double-click (verified live).
+                try:
+                    card = page.evaluate(self._FIND_DOCUMENT_CARD_JS)
+                except Exception:
+                    card = None
+                if card and card.get("x") is not None:
+                    cx, cy = int(card["x"]), int(card["y"])
+                    try:
+                        page.mouse.dblclick(cx, cy)
+                        return {"done": True, "target": tgt, "dblclicked": [cx, cy], "via": "document-card"}
+                    except Exception:
+                        pass
+                return {"done": False, "target": tgt, "error": "no document card visible"}
+            aliased: list[str] = [tgt]
+            if tgt.lower() in ("sketch", "new sketch"):
+                # feature toolbar tooltip is 'Create new sketch (shift+s)'
+                aliased = [tgt, "Create new sketch"]
+            if tgt.lower() == "corner rectangle":
+                # sketch-mode toolbar tooltip 'Corner rectangle (g)'; if no
+                # sketch is open, the S-search opens the tool instead.
+                aliased = [tgt, "Corner rectangle (g)"]
+            if tgt.lower() == "check":
+                # feature dialog header checkmark has NO label — resolve by
+                # position inside the open dialog (probe-verified).
+                try:
+                    pt = page.evaluate(self._FIND_DIALOG_CHECK_JS)
+                except Exception:
+                    pt = None
+                if pt and pt.get("x") is not None:
+                    cx, cy = int(pt["x"]), int(pt["y"])
+                    try:
+                        page.mouse.click(cx, cy)
+                        return {"done": True, "target": tgt, "clicked": [cx, cy], "via": "dialog-check"}
+                    except Exception:
+                        pass
+            res = None
+            for lbl in aliased:
+                res = self._click_by_label(page, lbl, action.get("i"))
+                if res:
+                    return {"done": True, "target": action["target"], **res}
+            if (x or y) and not action.get("origin"):
+                # The model ALSO gave pixel coordinates: pixel fallback is
+                # intentional (pixel-click with a label hint).
+                pass
+            else:
+                # Target-only click with no real x,y: NEVER fall back to
+                # clicking (0,0) — that corner click was a live failure mode.
+                # Report the miss so the caller can retry or re-scope.
+                return {"done": False, "target": action["target"], "error": f"no visible element labeled '{action['target'][:40]}'"}
 
         if kind == "click":
             page.mouse.click(x, y)
@@ -472,6 +767,12 @@ class BrowserDriver:
             if _typing_focused(page):
                 page.keyboard.type(text, delay=25)
                 return {"done": True, "typed": len(text)}
+            if not (x or y) and str(action.get("reason") or "").startswith("authored:"):
+                # Authored value entry is meant for an already-focused field
+                # (the preceding click act focused it). Going through the
+                # shortcut search with a bare number would insert garbage —
+                # report the miss instead.
+                return {"done": False, "error": "no field focused for authored type"}
             # Nothing focused: typing would silently vanish. Run it through the
             # shortcut search (S -> text -> Enter) — what the model MEANS when
             # it "types" a tool name at the canvas. This fixed the run that
@@ -607,12 +908,26 @@ def _playwright_key(key: str) -> str:
 class FakeBrowser:
     """Test double with the same surface as BrowserDriver (no Playwright needed)."""
 
+    # -- dom-label clicks ---------------------------------------------------
+
+    def _click_by_label(self, page: Any, label: str, index: Any = None) -> dict[str, Any] | None:
+        """FakeBrowser has no DOM; upgrades to a regular pixel click instead."""
+        return None
+
     def __init__(self, viewport: tuple[int, int] = (1440, 900)):
         self.viewport = viewport
         self.actions: list[dict[str, Any]] = []
         self.captured: list[dict[str, Any]] = []
         self._started = False
+        self.fullscreen = False
         self.current_url = "https://cad.onshape.com/documents"
+
+    def set_fullscreen(self, on: bool) -> dict[str, Any]:
+        self.fullscreen = bool(on)
+        return {"done": True, "fullscreen": self.fullscreen}
+
+    def toggle_window_state(self, state: str) -> dict[str, Any]:
+        return self.set_fullscreen(str(state or "").strip().lower() in {"fullscreen", "f11", "full"})
 
     @property
     def available(self) -> bool:

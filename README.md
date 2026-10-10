@@ -18,6 +18,13 @@ Each person runs the sidecar and Ollama **on their own machine**. The sidecar bi
 - Do **not** port-forward `8767` (or Ollama's `11434`).
 - The browser profile in the dataset folder holds your Onshape login — never commit or send it (it is gitignored).
 
+## Privacy & Security
+
+- **All traffic stays local.** The sidecar talks only to `http://127.0.0.1:11434` (Ollama) and `cad.onshape.com` — screenshots are never sent anywhere else, and only Ollama (running on your machine) ever sees a screenshot.
+- **Verified security limits (tested in the suite):** loopback-only bind with `Host`/`Origin` checks (blocks DNS rebinding), request body-size caps, refusal of non-`*.onshape.com` navigation (model can't roam), Ollama model names validated (no Modelfile/API injection), the sidecar refuses non-loopback requests outright, and video-learn paths outside the dataset folder are refused.
+- **Your Onshape session never leaves the dataset folder.** Chrome profile cookies live in `agent_dataset/browser_profile` — gitignored and not readable by other users on the machine (please confirm if you host a shared machine). Nothing in the repo contains credentials, and the `/status` and `/skills` responses never include absolute local paths.
+- **No telemetry.** No phone-home, no analytics, no accounts. Everything runs and stays on your machine.
+
 ## Requirements
 
 - Python 3.13 (64-bit) from [python.org](https://www.python.org/downloads/)
@@ -118,7 +125,8 @@ On Linux/macOS use `.venv-agent/bin/python` instead (or `./start.sh` for the sid
 
 | Mode | What happens |
 | --- | --- |
-| **Run** (plan + vision) | Local text model writes a 3–14 step CAD plan; the vision model executes each step from screenshots |
+| **Run** (plan) | Simple primitives ("make me a cube/box/square/block") are built by a **deterministic authored recipe**: every toolbar/feature-dialog action is a real DOM-label click (no pixel guessing), and the vision model only verifies and clicks canvas geometry |
+| **Run** (LLM plan) | Other goals: local text model writes a 3–14 step CAD plan; the vision model executes each step from screenshots |
 | **Run** (`--no-plan`) | Pure vision: every step decided straight from the screen |
 | **Record** | Watches the agent's own tab; saves your clicks/keys + screenshots as an episode |
 | **Replay** | Replays the last recorded episode in a fresh tab |
@@ -175,7 +183,7 @@ No GPU, no Ollama, no browser needed:
 python -m unittest discover -s tests
 ```
 
-- 252 tests covering loopback security, action/plan parsing, memory, the video teacher pipeline, browser allowlists, the agent loop (with an injected fake browser), the HTTP sidecar, and the desktop GUI's sidecar client.
+- 260 tests covering loopback security, action/plan parsing, authored primitive recipes, memory, the video teacher pipeline, browser allowlists, the agent loop (with an injected fake browser), the HTTP sidecar, and the desktop GUI's sidecar client.
 - The GitHub Actions workflow (`.github/workflows/tests.yml`) is **optional** — it only re-runs this suite on GitHub's servers. Nothing in the app depends on it; the tests above run identically on any machine.
 
 Optional end-to-end smoke tests (need the optional deps):
